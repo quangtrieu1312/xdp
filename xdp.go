@@ -130,6 +130,7 @@ type umemRing struct {
 type rxTxRing struct {
 	Producer *uint32
 	Consumer *uint32
+	Flags    *uint32
 	Descs    []Desc
 }
 
@@ -161,6 +162,12 @@ type SocketOptions struct {
 	CompletionRingNumDescs int
 	RxRingNumDescs         int
 	TxRingNumDescs         int
+
+	// UseNeedWakeup binds the socket with XDP_USE_NEED_WAKEUP. When set, the
+	// kernel maintains the XDP_RING_NEED_WAKEUP flag on the Tx ring, and
+	// Transmit only issues the sendto kick when that flag is set — eliminating
+	// the per-batch syscall when the kernel is already draining the ring.
+	UseNeedWakeup bool
 }
 
 // Desc represents an XDP Rx/Tx descriptor.
@@ -364,14 +371,19 @@ func NewSocket(Ifindex int, QueueID int, options *SocketOptions) (xsk *Socket, e
 
 		xsk.txRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Producer)))
 		xsk.txRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Consumer)))
+		xsk.txRing.Flags = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Flags)))
 		sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.txRing.Descs))
 		sh.Data = uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Desc)
 		sh.Len = options.TxRingNumDescs
 		sh.Cap = options.TxRingNumDescs
 	}
 
+	sockFlags := DefaultSocketFlags
+	if options.UseNeedWakeup {
+		sockFlags |= unix.XDP_USE_NEED_WAKEUP
+	}
 	sa := unix.SockaddrXDP{
-		Flags:   DefaultSocketFlags,
+		Flags:   sockFlags,
 		Ifindex: uint32(Ifindex),
 		QueueID: uint32(QueueID),
 	}
@@ -464,6 +476,14 @@ func (xsk *Socket) Transmit(descs []Desc) (numSubmitted int) {
 	xsk.numTransmitted += len(descs)
 
 	numSubmitted = len(descs)
+
+	// With XDP_USE_NEED_WAKEUP the kernel only needs a sendto kick when it has
+	// set the NEED_WAKEUP flag on the Tx ring; skipping it otherwise removes the
+	// per-batch syscall on the hot TX path. When the option is off, txRing.Flags
+	// stays zero, so we must fall back to always kicking.
+	if xsk.options.UseNeedWakeup && (*xsk.txRing.Flags&unix.XDP_RING_NEED_WAKEUP) == 0 {
+		return
+	}
 
 	var rc uintptr
 	var errno syscall.Errno
